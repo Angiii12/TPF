@@ -1,0 +1,18 @@
+{
+    "df_unificado": {
+        "hash": "54408108e067fe6fda55bc4e4f1b6f67",
+        "nombre_clave": "df_unificado"
+    },
+    "df_imputado": {
+        "hash": "2de4a12b191e8220f4dc6c82804b5d2b",
+        "nombre_clave": "df_imputado"
+    },
+    "df_train": {
+        "hash": "553eba956ba9d7918924c767c2f34beb",
+        "nombre_clave": "df_train"
+    },
+    "df_test": {
+        "hash": "d22a5c8e99544f96d65579f8027f8519",
+        "nombre_clave": "df_test"
+    }
+}
