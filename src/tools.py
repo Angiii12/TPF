@@ -32,7 +32,6 @@ def checksum(dataframe, nombre_clave):
     # Preparamos tu 'checksum_info'
     checksum_info_nuevo = {
         'hash': hash_md5_nuevo,
-        'ruta': ruta_checksum,
         'nombre_clave': nombre_clave 
     }
     
