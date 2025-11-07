@@ -8,11 +8,11 @@
         "nombre_clave": "df_imputado"
     },
     "df_train": {
-        "hash": "84cfe263bf60b081f486153bfd5f5082",
+        "hash": "d344c2825368d7521c58b2a6a3d778e9",
         "nombre_clave": "df_train"
     },
     "df_test": {
-        "hash": "37387ee1ea2ebff9803aa80924233f28",
+        "hash": "51db82ecb2eca899eae5b62dcce46a63",
         "nombre_clave": "df_test"
     }
 }

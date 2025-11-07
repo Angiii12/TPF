@@ -2,5 +2,5 @@
     "descripcion": "Dataset final procesado, con lags, features ciclicas y ratios.",
     "fuente_original": "data/dataset_train_escalado.csv y data/dataset_test_escalado.csv",
     "script_transformacion": "notebooks/preprocesamiento.ipynb",
-    "fecha_creacion": "2025-11-06T15:49:24.130412"
+    "fecha_creacion": "2025-11-07T13:05:08.876036"
 }
