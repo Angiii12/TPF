@@ -3,13 +3,13 @@ import numpy as np
 import datetime as _dt
 from functools import reduce
 import joblib
+from joblib import load
 from pathlib import Path
 import json
 from sklearn.impute import KNNImputer
 from itertools import combinations
 import re
 import requests
-
 
 # ----------------- Config -----------------
 DAY_COL, HOUR_COL = "DIA", "HORA"
@@ -97,8 +97,27 @@ def apply_iqr_knn(df_filtrado, thresholds_path="thresholds.joblib", exclude=None
 
     return df
 
+# -------- util de nombres --------
+_NBSP = u"\u00A0"
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    g = df.copy()
+    g.columns = [re.sub(r"\s+", " ", str(c).replace(_NBSP, " ")).strip() for c in g.columns]
+    return g
+
+def _require_day_hour(df: pd.DataFrame, hoja: str):
+    missing = [c for c in (DAY_COL, HOUR_COL) if c not in df.columns]
+    if missing:
+        raise KeyError(f"No puedo encontrar el DIA / HORA en la hoja {hoja}: faltan {missing}")
+
 def _to_minutes(h):
     try:
+        # soporte extra: horas como float Excel (fracción del día)
+        if isinstance(h, (int, float)) and 0 <= float(h) < 1:
+            total_seconds = float(h) * 24 * 60 * 60
+            hh = int(total_seconds // 3600)
+            mm = int((total_seconds % 3600) // 60)
+            ss = int(total_seconds % 60)
+            return hh*60 + mm + ss/60
         hh, mm, *rest = str(h).split(":")
         ss = int(rest[0]) if rest else 0
         return int(hh)*60 + int(mm) + ss/60
@@ -107,33 +126,38 @@ def _to_minutes(h):
 
 def _interpolar_nans_existentes(df, day_col=DAY_COL, hour_col=HOUR_COL):
     g = df.copy()
+    # validación fuerte
+    if day_col not in g.columns or hour_col not in g.columns:
+        raise KeyError("No puedo encontrar el DIA / HORA")
+
+    # index datetime diario (a medianoche) para 'time' interpolate entre días
     g["_fecha"] = pd.to_datetime(g[day_col], errors="coerce", dayfirst=True)
-    g = g.dropna(subset=["_fecha"]).set_index("_fecha")
+    g = g.dropna(subset=["_fecha"]).sort_values("_fecha").set_index("_fecha")
     num_cols = g.select_dtypes(include="number").columns
     if len(num_cols) > 0:
-        g[num_cols] = g[num_cols].interpolate(method="time").ffill().bfill()
+        g[num_cols] = g[num_cols].interpolate(method="time", limit_direction="both")
+        g[num_cols] = g[num_cols].ffill().bfill()
+    # fallback de HORA a 23:59
     if hour_col in g.columns:
+        g[hour_col] = g[hour_col].astype(str).str.strip().replace({"": np.nan})
         g[hour_col] = g[hour_col].fillna("23:59:00")
     return g.reset_index(drop=True)
 
-DAY_CANDIDATES = ("dia", "día", "Dia", "DIA")
-def _detectar_col_dia(df, candidatos=DAY_CANDIDATES):
-    cols = [str(c) for c in df.columns]
-    cand = [c for c in cols if any(p in c.lower() for p in candidatos)]
-    preferencia = ["dia", "día", "Dia", "DIA"]
-    return sorted(cand, key=lambda c: next((i for i,p in enumerate(preferencia) if p in c.lower()), 99))[0]
-
 def _prep_por_hoja(nombre, df):
-    col = _detectar_col_dia(df)
-    g = df.copy()
-    g[col] = pd.to_datetime(g[col], errors="coerce", dayfirst=True).dt.normalize()
-    if col != "dia":
-        g = g.rename(columns={col: "dia"})
-    if g.duplicated("dia").any():
-        g = g.sort_values("dia").drop_duplicates("dia", keep="last")
-    cols_no_clave = [c for c in g.columns if c != "dia"]
-    g = g[["dia"] + cols_no_clave].add_suffix(f"__{nombre}")
-    g = g.rename(columns={f"dia__{nombre}": "dia"})
+    # asume columna DIA y HORA; renombra y sufija como antes
+    g = _clean_cols(df)
+    _require_day_hour(g, nombre)
+
+    # normaliza DIA a date
+    g["DIA"] = pd.to_datetime(g["DIA"], errors="coerce", dayfirst=True).dt.normalize()
+    # ordena y quita duplicados por día (último gana)
+    if g.duplicated("DIA").any():
+        g = g.sort_values(["DIA"]).drop_duplicates("DIA", keep="last")
+
+    # reordena con DIA primero, sufija resto
+    cols_no_clave = [c for c in g.columns if c != "DIA"]
+    g = g[["DIA"] + cols_no_clave].add_suffix(f"__{nombre}")
+    g = g.rename(columns={f"DIA__{nombre}": "dia"})
     return g
 
 def _unir_diccionario_por_dia(dic, hojas_incluir=None):
@@ -145,28 +169,88 @@ def _unir_diccionario_por_dia(dic, hojas_incluir=None):
             dfs_norm.append(_prep_por_hoja(nombre, df))
     if not dfs_norm:
         return pd.DataFrame(columns=["dia"])
-    df_unif = reduce(lambda l, r: pd.merge(l, r, on="dia", how="outer"), dfs_norm)
-    return df_unif.sort_values("dia").reset_index(drop=True)
+    df_unif = reduce(lambda l, r: pd.merge(l, r, on="dia", how="outer", sort=False), dfs_norm)
+    return df_unif.sort_values("dia", kind="stable").reset_index(drop=True)
+
+def _resolver_hojas_a_usar(xls: pd.ExcelFile, hojas_incluir):
+    todas = list(xls.sheet_names)
+
+    if hojas_incluir is None:
+        hojas_usar = todas
+    else:
+        # match case-insensitive y preserva el orden pedido por el usuario
+        low_map = {h.lower(): h for h in todas}
+        hojas_usar = []
+        faltantes = []
+        for h in hojas_incluir:
+            real = low_map.get(str(h).lower())
+            if real is None:
+                faltantes.append(h)
+            else:
+                hojas_usar.append(real)
+        if faltantes:
+            raise KeyError(f"Hojas solicitadas no encontradas en el Excel: {faltantes}")
+
+    # referencia: si está "Consolidado EE" dentro de hojas_usar, úsala; si no, la primera de hojas_usar
+    ref_name = "Consolidado EE" if "Consolidado EE" in hojas_usar else (hojas_usar[0] if hojas_usar else None)
+    if ref_name is None:
+        raise ValueError("El archivo no contiene hojas utilizables.")
+
+    return hojas_usar, ref_name
+
+
+def aplicar_scaler(df_in, preproc_path, ycol: str = "y"):
+    preproc_path = Path(preproc_path)
+    preproc = load(preproc_path)  # carga el Pipeline fit-eado
+
+    df = df_in.copy()
+
+    # Detectar las features entrenadas
+    if hasattr(preproc, "transformers_"):  # típico de ColumnTransformer (no es tu caso)
+        feats = list(preproc.transformers_[0][2])
+    elif hasattr(preproc, "feature_names_in_"):
+        feats = list(preproc.feature_names_in_)
+    else:
+        feats = [c for c in df.columns if c != ycol]
+
+    # Asegurar que existan todas las columnas (nota: NaN romperá PowerTransformer)
+    for c in feats:
+        if c not in df.columns:
+            # Recomendación: llenar con 0 en vez de NaN para evitar error
+            df[c] = 0.0
+
+    X = preproc.transform(df[feats])
+    X_df = pd.DataFrame(X, columns=feats, index=df.index) if isinstance(X, np.ndarray) else X
+    df.loc[:, feats] = X_df.values
+    return df
 
 # --------------- Pipeline -----------------
 def procesar_y_unificar_excel(xls_io, hojas_incluir=None):
-    # 1) Carga
+    # 1) Carga solo de hojas necesarias (con limpieza de nombres y validación DIA/HORA)
     xls = pd.ExcelFile(xls_io)
-    dfs = {hoja: pd.read_excel(xls, sheet_name=hoja) for hoja in xls.sheet_names}
+    hojas_usar, ref_name = _resolver_hojas_a_usar(xls, hojas_incluir)
 
-    # 2) Referencia (Consolidado EE si existe; si no, primera hoja)
-    ref_name = "Consolidado EE" if "Consolidado EE" in dfs else next(iter(dfs))
+    dfs = {}
+    for hoja in hojas_usar:
+        df = pd.read_excel(xls, sheet_name=hoja)
+        df = _clean_cols(df)           # igual que antes
+        _require_day_hour(df, hoja)    # igual que antes (KeyError claro si falta)
+        dfs[hoja] = df
+
+    # 2) Referencia (sobre el subconjunto)
     df_ref = dfs[ref_name].copy()
     df_ref["_dia"]  = pd.to_datetime(df_ref[DAY_COL], errors="coerce", dayfirst=True).dt.date
     df_ref["_mins"] = df_ref[HOUR_COL].map(_to_minutes)
-    df_ref = df_ref.dropna(subset=["_dia", "_mins"]).sort_values(["_dia", "_mins"])
+    df_ref = df_ref.dropna(subset=["_dia", "_mins"]).sort_values(["_dia", "_mins"], kind="stable")
 
     if df_ref.empty:
+        # sin referencia válida: unir directo (no gastamos en 23:59 ni interpolación)
         dfs_interpolado = {k: v.copy() for k, v in dfs.items()}
-        return _unir_diccionario_por_dia(dfs_interpolado, hojas_incluir)
+        return _unir_diccionario_por_dia(dfs_interpolado, hojas_incluir=hojas_usar)
 
-    primer_dia = df_ref["_dia"].min()
-    ultimo_dia = df_ref["_dia"].max()
+    # --- lo que sigue es igual a tu flujo actual (calculado una sola vez con df_ref) ---
+    primer_dia  = df_ref["_dia"].min()
+    ultimo_dia  = df_ref["_dia"].max()
     dias_presentes = set(df_ref["_dia"].unique())
     ideal_range = pd.date_range(start=primer_dia, end=ultimo_dia, freq="D").date
     dias_faltantes_lista = sorted(list(set(ideal_range) - dias_presentes))
@@ -180,16 +264,20 @@ def procesar_y_unificar_excel(xls_io, hojas_incluir=None):
             if not grupo or (d - grupo[-1]) == one_day:
                 grupo.append(d)
             else:
-                if len(grupo) < LIMITE_CONSECUTIVOS: dias_faltantes_filtrados.extend(grupo)
+                if len(grupo) < LIMITE_CONSECUTIVOS:
+                    dias_faltantes_filtrados.extend(grupo)
                 grupo = [d]
-        if len(grupo) < LIMITE_CONSECUTIVOS: dias_faltantes_filtrados.extend(grupo)
+        if len(grupo) < LIMITE_CONSECUTIVOS:
+            dias_faltantes_filtrados.extend(grupo)
 
     minuto_23_59 = 23*60 + 59
     dias_con_23_59 = set(df_ref[(df_ref["_mins"] >= minuto_23_59) & (df_ref["_mins"] < minuto_23_59 + 1)]["_dia"].unique())
     dias_sin_23_59_lista = sorted(list(dias_presentes - dias_con_23_59))
+
     registros_por_dia = df_ref.groupby("_dia").size()
     dias_con_horas_faltantes_con_23_59 = sorted(list(set(registros_por_dia[registros_por_dia < 24].index) - set(dias_sin_23_59_lista)))
 
+    # detección de mala monotonía (solo si VAL_COL está en la hoja de referencia)
     dias_mala_monotonia_lista = []
     if VAL_COL in df_ref.columns:
         for d, g in df_ref.groupby("_dia", sort=True):
@@ -197,10 +285,10 @@ def procesar_y_unificar_excel(xls_io, hojas_incluir=None):
             if s.size and (pd.Series(s).diff().fillna(0) < -EPS).any():
                 dias_mala_monotonia_lista.append(d)
 
-    lista_para_nan = set(dias_faltantes_filtrados) | set(dias_con_horas_faltantes_con_23_59) | set(dias_sin_23_59_lista)
+    lista_para_nan       = set(dias_faltantes_filtrados) | set(dias_con_horas_faltantes_con_23_59) | set(dias_sin_23_59_lista)
     lista_mala_monotonia = set(dias_mala_monotonia_lista)
 
-    # 3) Filtrado 23:59 + crear filas faltantes + anular datos
+    # 3) Filtrado 23:59 + crear filas faltantes + anular datos (solo sobre hojas_usar)
     dfs_23_59 = {}
     for hoja, df in dfs.items():
         tmp = df.copy()
@@ -210,11 +298,16 @@ def procesar_y_unificar_excel(xls_io, hojas_incluir=None):
         tmp = tmp.dropna(subset=["_dia", "_mins"]).sort_values(["_dia", "_mins", "_ord"], kind="stable")
 
         df_23_59 = tmp[(tmp["_mins"] >= minuto_23_59) & (tmp["_mins"] < minuto_23_59 + 1)].copy()
-        mask_mono = df_23_59["_dia"].isin(lista_mala_monotonia)
-        df_monos  = df_23_59[mask_mono].drop_duplicates(subset=["_dia"], keep="first")
-        df_buenos = df_23_59[~mask_mono].drop_duplicates(subset=["_dia"], keep="last")
-        df_unif   = pd.concat([df_buenos, df_monos], ignore_index=True)
 
+        if not df_23_59.empty:
+            mask_mono = df_23_59["_dia"].isin(lista_mala_monotonia)
+            df_monos  = df_23_59[mask_mono].drop_duplicates(subset=["_dia"], keep="first")
+            df_buenos = df_23_59[~mask_mono].drop_duplicates(subset=["_dia"], keep="last")
+            df_unif   = pd.concat([df_buenos, df_monos], ignore_index=True)
+        else:
+            df_unif = pd.DataFrame(columns=tmp.columns)
+
+        # crear días faltantes (filtrados por límite) con 23:59
         dias_ya = set(df_unif["_dia"]) if not df_unif.empty else set()
         dias_crear = lista_para_nan - dias_ya
         if dias_crear:
@@ -225,6 +318,7 @@ def procesar_y_unificar_excel(xls_io, hojas_incluir=None):
             df_unif[DAY_COL]  = df_unif[DAY_COL].fillna(df_unif["_dia"])
             df_unif[HOUR_COL] = df_unif[HOUR_COL].fillna("23:59:00")
 
+        # anular columnas no clave en días problemáticos
         cols_para_nan = [c for c in df.columns if c not in (DAY_COL, HOUR_COL)]
         if cols_para_nan:
             df_unif.loc[df_unif["_dia"].isin(lista_para_nan), cols_para_nan] = np.nan
@@ -232,21 +326,46 @@ def procesar_y_unificar_excel(xls_io, hojas_incluir=None):
         columnas_finales = df.columns.tolist()
         dfs_23_59[hoja] = (
             df_unif.reindex(columns=columnas_finales)
-                  .sort_values(DAY_COL)
+                  .sort_values(DAY_COL, kind="stable")
                   .reset_index(drop=True)
         )
 
-    # 4) Interpolar y sobrescribir
+    # 4) Interpolar y sobrescribir (solo sobre hojas_usar)
     dfs_interpolado = {k: _interpolar_nans_existentes(v) for k, v in dfs_23_59.items() if not v.empty}
 
-    # 5) Unificación por día
-    df_unificado = _unir_diccionario_por_dia(dfs_interpolado, hojas_incluir=hojas_incluir)
+    # 5) Unificación por día (restringida a hojas_usar)
+    df_unificado = _unir_diccionario_por_dia(dfs_interpolado, hojas_incluir=hojas_usar)
 
-    columnas_horas = ['HORA__Consolidado KPI', 'HORA__Consolidado Produccion', 'HORA__Consolidado EE', 'HORA__Consolidado Agua',
-                    'HORA__Consolidado GasVapor', 'HORA__Consolidado Aire', 'HORA__Totalizadores Energia']
-    
-    df_unificado["HORA"] = pd.to_datetime(df_unificado["HORA__Consolidado KPI"].astype(str).str.strip(),format="%H:%M:%S", errors="coerce").dt.time
-    df_unificado = df_unificado.drop(columns=[c for c in columnas_horas if c in df_unificado.columns])
+    # 6) HORA final con prioridad original pero filtrada al subconjunto
+    preferencia_horas = [
+        'HORA__Consolidado KPI',
+        'HORA__Consolidado Produccion',
+        'HORA__Consolidado EE',
+        'HORA__Consolidado Agua',
+        'HORA__Consolidado GasVapor',
+        'HORA__Consolidado Aire',
+        'HORA__Totalizadores Energia',
+    ]
+    # quedarnos solo con las que pertenezcan a hojas_usar y existan en columnas
+    candidatas = [c for c in preferencia_horas
+                  if (c in df_unificado.columns) and (c.split("__", 1)[1] in hojas_usar)]
+    if not candidatas:
+        # fallback: cualquier HORA__* presente (por si la lista anterior no contempla algún nombre)
+        candidatas = [c for c in df_unificado.columns if c.startswith("HORA__")]
+
+    if not candidatas:
+        raise KeyError("No puedo encontrar el HORA final (ninguna columna HORA__* presente tras unificar).")
+
+    hora_src = candidatas[0]
+    df_unificado["HORA"] = pd.to_datetime(
+        df_unificado[hora_src].astype(str).str.strip(),
+        format="%H:%M:%S", errors="coerce"
+    ).dt.time
+
+    # drop de todas las HORA__* que hayan quedado (solo de las hojas usadas)
+    drop_horas = [c for c in df_unificado.columns if c.startswith("HORA__")]
+    if drop_horas:
+        df_unificado = df_unificado.drop(columns=drop_horas)
 
     return df_unificado
 
@@ -289,8 +408,8 @@ def feature_engineering(df_imputado):
     df[f'{ycol}_ma7'] = y_obs.rolling(window=7, min_periods=1).mean()
 
     # Creacion de interacciones
-    top5 = ['Sala Maq (Kw)__Consolidado EE', 'Servicios (Kw)__Consolidado EE', 'KW Gral Planta__Totalizadores Energia', 
-            'KW Gral Planta__Consolidado EE', 'Planta (Kw)__Consolidado EE', 'Agua Planta (Hl)__Consolidado Agua']
+    top5 = ['Sala Maq (Kw)__Consolidado EE', 'Servicios (Kw)__Consolidado EE', 'KW Gral Planta__Consolidado EE', 
+            'Planta (Kw)__Consolidado EE', 'Agua Planta (Hl)__Consolidado Agua']
     for a, b in combinations(top5, 2):
         df[f'{a}x{b}'] = df[a] * df[b]
     for cyc in ['dow_sin', 'dow_cos', 'mes_sin', 'mes_cos']:
@@ -361,7 +480,6 @@ def feature_engineering(df_imputado):
     })
     df = df.merge(wx_d, on="fecha", how="left")
 
-
     # Limpiar
     df = df.iloc[7:].copy()
     df = df.fillna(0)
@@ -370,7 +488,7 @@ def feature_engineering(df_imputado):
     return df_imputado, df_imputado['dia'], df_imputado['HORA']
 
 
-def seleccionar_variables(df_seleccion):
+def seleccionar_variables(df_seleccion, scaler_path):
     
     variables_30 = ['Frio_ma7', 'Frio', 'ratio_Bodega_sobre_Sala_Maq', 'ratio_Sala_Maq_sobre_Bodega', 'Sala Maq (Kw)__Consolidado EExServicios (Kw)__Consolidado EE', 'Sala Maq (Kw)__Consolidado EE',
                     'Bodega_share', 'Sala Maq (Kw)__Consolidado EE_x_mes_cos', 'ratio_Servicios_sobre_Bodega', 'Servicios (Kw)__Consolidado EE_x_mes_cos',
@@ -381,18 +499,42 @@ def seleccionar_variables(df_seleccion):
                     'CO 2 Linea 4 / Hl__Consolidado KPI', 'Red Paste L4__Consolidado Agua', 'ET Linea 3/Hl__Consolidado KPI', 'Totalizador_Aire_Cocina__Consolidado Aire']
 
     df_final = df_seleccion.copy()
+
+    # Si falta alguna de las 30, crearla como NaN para que el preprocesador pueda imputar/transformar
+    for c in variables_30:
+        if c not in df_final.columns:
+            df_final[c] = np.nan
+
+    # Quedarme solo con las 30 + 'y'
     df_final = df_final[variables_30 + ['y']]
 
-    # FALTA ESCALADO Y TRANSFORMACION
-    return df_final
+    # Aplicar el preprocesador único (sin tocar 'y')
+    df_final_tx = aplicar_scaler(df_final, scaler_path, ycol="y")
 
-def main(xls_io, json_path, thresholds_path):
+    # Devolver solo las 30 + 'y' (por si el preproc añadió algo más)
+    return df_final_tx[variables_30 + ['y']]
+
+
+def main(xls_io):
+    # --- rutas robustas, relativas al repo ---
+    THIS_FILE = Path(__file__).resolve()    # .../TPF/src/pipeline_preprocesamiento.py
+    REPO_DIR  = THIS_FILE.parents[1]        # .../TPF
+    DATA_DIR  = REPO_DIR / "data"           # .../TPF/data
+
+    json_path      = DATA_DIR / "variables.json"
+    scaler_path    = DATA_DIR / "preproc_minmax_power.joblib"
+    thresholds_path = max(DATA_DIR.glob("thresholds_*.joblib"), key=lambda p: p.stat().st_mtime)     # último thresholds_*.joblib (por fecha)
+
+    #  Validación rápida
+    for p in [json_path, scaler_path, thresholds_path]:
+        if not p.exists():
+            raise FileNotFoundError(f"No se encontró: {p}")
+
     hojas_incluir = ["Consolidado KPI","Consolidado Produccion","Consolidado EE", "Consolidado Agua",
                      "Consolidado GasVapor","Consolidado Aire", "Totalizadores Energia"]
     df_unificado = procesar_y_unificar_excel(xls_io, hojas_incluir=hojas_incluir)
     df_impuratado = outliers_detection(df_unificado, json_path, thresholds_path)
     df_final, dias, horas = feature_engineering(df_impuratado)
-    df_seleccion = seleccionar_variables(df_final)
+    df_seleccion = seleccionar_variables(df_final, scaler_path)
 
-    # ponemos fecha y hora ???
-    return df_seleccion, dias, horas 
+    return df_seleccion, dias, horas
