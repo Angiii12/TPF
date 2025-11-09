@@ -13,7 +13,7 @@
         "rmse": 3344.562110192831,
         "r2": 0.6345769460767741
       },
-      "artifact_path": "C:/Users/Usuario/OneDrive/Documentos/Marcos/Facultad/UNL/6to cuatrimestre/Laboratorio de datos II/TPs/Trabajo final/TPF/models/modelo_v1.0.0.pkl",
+      "artifact_path": "models/modelo_v1.0.0.pkl",
       "git_commit": "d36c1b1765c9a1aa5cb375c80315073972a06b29",
       "trained_at": "2025-11-09T11:03:08",
       "sklearn_version": "1.7.2"
