@@ -104,6 +104,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+cervecera_env/
+*.env
+.venv
 
 # Spyder project settings
 .spyderproject
@@ -122,3 +125,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# El asterisco (*) es un comodín que significa "cualquier cosa"
+data/*.xlsx
+
+# 2. Ignora TODOS los archivos .pdf DENTRO de data/
+data/*.pdf

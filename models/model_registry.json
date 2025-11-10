@@ -1,0 +1,22 @@
+{
+  "latest": "v1.0.0",
+  "models": [
+    {
+      "version": "v1.0.0",
+      "model_class": "RandomForestRegressor",
+      "hyperparameters": {
+        "n_estimators": 150,
+        "max_depth": 7
+      },
+      "validation_metrics": {
+        "mae": 2535.2987332172024,
+        "rmse": 3344.562110192831,
+        "r2": 0.6345769460767741
+      },
+      "artifact_path": "models/modelo_v1.0.0.pkl",
+      "git_commit": "d36c1b1765c9a1aa5cb375c80315073972a06b29",
+      "trained_at": "2025-11-09T11:03:08",
+      "sklearn_version": "1.7.2"
+    }
+  ]
+}

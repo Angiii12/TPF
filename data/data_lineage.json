@@ -1,0 +1,11 @@
+{
+    "descripcion": "Datasets finales procesados, escalados SIN LEAKAGE, y separados en train/val/test.",
+    "fuentes_creadas": [
+        "../data/dataset_train_final.csv",
+        "../data/dataset_val_final.csv",
+        "../data/dataset_test_final.csv"
+    ],
+    "script_transformacion": "notebooks/preprocesamiento.ipynb",
+    "fecha_creacion": "2025-11-07T18:50:06.707448",
+    "cutoff_date_train_val": "2022-07-01"
+}
